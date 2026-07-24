@@ -47,6 +47,7 @@ private:
     bool ShouldSkipElement(lxb_dom_element_t *element);
     bool HasClass(lxb_dom_element_t *element, std::string_view className) const;
     TableType DetectTableType(lxb_dom_element_t *element) const;
+    std::string_view DetectCodeLanguage(lxb_dom_element_t *element) const;
 
     void WritePageHeader();
     void WriteFooter();

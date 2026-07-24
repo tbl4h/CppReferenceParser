@@ -327,6 +327,9 @@ bool CppReferenceExtractor::VisitElement(
 
     case LXB_TAG_PRE:
         EnsureNewline();
+        Write("```");
+        Write(DetectCodeLanguage(element).data());
+        AppendNewline();
         ++m_preDepth;
         break;
 
@@ -409,6 +412,8 @@ void CppReferenceExtractor::LeaveElement(
             --m_preDepth;
         }
 
+        EnsureNewline();
+        Write("```");
         AppendNewline();
         break;
 
@@ -548,6 +553,37 @@ CppReferenceExtractor::TableType CppReferenceExtractor::DetectTableType(
     }
 
     return TableType::Generic;
+}
+
+std::string_view CppReferenceExtractor::DetectCodeLanguage(
+    lxb_dom_element_t *element) const
+{
+    for (lxb_dom_node_t *node = lxb_dom_interface_node(element);
+         node != nullptr;
+         node = node->parent)
+    {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        {
+            continue;
+        }
+
+        lxb_dom_element_t *current =
+            lxb_dom_interface_element(node);
+
+        if (HasClass(current, "source-text") ||
+            HasClass(current, "text"))
+        {
+            return "";
+        }
+
+        if (HasClass(current, "source-cpp") ||
+            HasClass(current, "cpp"))
+        {
+            return "cpp";
+        }
+    }
+
+    return "cpp";
 }
 
 void CppReferenceExtractor::WritePageHeader()
