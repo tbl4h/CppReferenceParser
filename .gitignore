@@ -1,0 +1,43 @@
+# --- Build directories ---
+build/
+bin/
+out/
+target/
+
+# --- Compiled object / library files ---
+*.slo
+*.lo
+*.o
+*.obj
+
+# --- Precompiled headers ---
+*.gch
+*.pch
+
+# --- Compiled libraries ---
+*.lib
+*.a
+*.la
+*.lo
+
+# --- Shared objects (dynamic libraries) ---
+*.dll
+*.so
+*.dylib
+
+# --- Executables ---
+*.exe
+*.out
+*.app
+
+# --- IDEs and Editors (VS Code, CLion, Visual Studio) ---
+.vscode/
+.idea/
+*.suo
+*.user
+*.filters
+.vs/
+
+# --- OS generated files ---
+.DS_Store
+Thumbs.db
