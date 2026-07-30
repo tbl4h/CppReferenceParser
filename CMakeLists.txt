@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(CppReferenceExtractor LANGUAGES CXX)
+project(CppReferenceExtractor LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,16 +12,17 @@ add_executable(CppReferenceExtractor
 
 target_include_directories(CppReferenceExtractor
     PRIVATE
-        include
-        /opt/lexbor/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-find_package(lexbor CONFIG REQUIRED
-    PATHS /opt/lexbor/lib/cmake/lexbor
-    NO_DEFAULT_PATH
+# Test executable
+add_executable(CppReferenceExtractorTest
+    test/test_main.cpp
+    src/CppReferenceExtractor.cpp
 )
 
-target_link_libraries(CppReferenceExtractor
+target_include_directories(CppReferenceExtractorTest
     PRIVATE
-        lexbor::lexbor
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/test
 )

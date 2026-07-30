@@ -1,116 +1,433 @@
 #include "CppReferenceExtractor.hpp"
 
-#include <cstddef>
-#include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <sstream>
+#include <unordered_set>
 
-#include <lexbor/dom/interfaces/character_data.h>
-#include <lexbor/dom/interfaces/text.h>
-#include <lexbor/html/interfaces/document.h>
-#include <lexbor/tag/tag.h>
+namespace {
 
-namespace
-{
-bool IsAsciiWhitespace(unsigned char ch)
-{
-    return ch == ' ' ||
-           ch == '\n' ||
-           ch == '\r' ||
-           ch == '\t' ||
-           ch == '\f' ||
-           ch == '\v';
+/// Check if character is whitespace
+inline bool IsWhitespace(char ch) {
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
 }
 
-bool IsNbsp(const lxb_char_t *text, size_t length, size_t index)
-{
-    return index + 1 < length &&
-           text[index] == 0xC2 &&
-           text[index + 1] == 0xA0;
-}
+/// Decode HTML entities
+std::string DecodeHtmlEntities(const std::string &text) {
+    std::string result;
+    result.reserve(text.size());
 
-bool IsZeroWidthSpace(const lxb_char_t *text, size_t length, size_t index)
-{
-    return index + 2 < length &&
-           text[index] == 0xE2 &&
-           text[index + 1] == 0x80 &&
-           text[index + 2] == 0x8B;
-}
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '&') {
+            size_t end = text.find(';', i + 1);
+            if (end == std::string::npos) {
+                result.push_back('&');
+                continue;
+            }
 
-lxb_dom_element_t *FindFirstElementByTag(lxb_dom_node_t *node, lxb_tag_id_t tagId)
-{
-    if (node == nullptr)
-    {
-        return nullptr;
-    }
+            std::string entity = text.substr(i + 1, end - i - 1);
 
-    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
-    {
-        lxb_dom_element_t *element =
-            lxb_dom_interface_element(node);
+            // Named entities
+            if (entity == "amp") result += '&';
+            else if (entity == "lt") result += '<';
+            else if (entity == "gt") result += '>';
+            else if (entity == "quot") result += '"';
+            else if (entity == "apos") result += '\'';
+            else if (entity == "nbsp") result += ' ';
+            else if (entity == "mdash") result += "\xE2\x80\x94";
+            else if (entity == "ndash") result += "\xE2\x80\x93";
+            else if (entity == "hellip") result += "\xE2\x80\x26";
+            else if (entity == "rsquo") result += "\xE2\x80\x19";
+            else if (entity == "lsquo") result += "\xE2\x80\x18";
+            else if (entity == "rdquo") result += "\xE2\x80\x1D";
+            else if (entity == "ldquo") result += "\xE2\x80\x1C";
+            else if (entity == "bull") result += "\xE2\x80\x22";
+            else if (entity == "permil") result += "\xE2\x80\x30";
+            else if (entity == "deg") result += "\xC0\xb0";
+            else if (entity == "plusminus") result += "\xE2\x82\x13";
+            else {
+                // Numeric entity
+                if (!entity.empty() && entity[0] == 'x') {
+                    try {
+                        unsigned int codepoint = std::stoul(entity.substr(1), nullptr, 16);
+                        if (codepoint < 128) result += static_cast<char>(codepoint);
+                        else result += entity;
+                    } catch (...) {
+                        result += entity;
+                    }
+                } else {
+                    try {
+                        unsigned int codepoint = std::stoul(entity);
+                        if (codepoint < 128) result += static_cast<char>(codepoint);
+                        else result += entity;
+                    } catch (...) {
+                        result += entity;
+                    }
+                }
+            }
 
-        if (lxb_dom_element_tag_id(element) == tagId)
-        {
-            return element;
+            i = end;
+        } else {
+            result.push_back(text[i]);
         }
     }
 
-    for (lxb_dom_node_t *child = node->first_child;
-         child != nullptr;
-         child = child->next)
-    {
-        lxb_dom_element_t *match =
-            FindFirstElementByTag(child, tagId);
+    return result;
+}
 
-        if (match != nullptr)
-        {
-            return match;
+/// Extract class attribute value from attributes string
+std::string ExtractClass(const std::string &attrs) {
+    size_t pos = attrs.find("class=");
+    if (pos == std::string::npos) return "";
+
+    pos += 6;
+    if (pos >= attrs.size()) return "";
+
+    char quote = attrs[pos];
+    if (quote != '"' && quote != '\'') return "";
+
+    pos++;
+    size_t end = attrs.find(quote, pos);
+    if (end == std::string::npos) return attrs.substr(pos);
+
+    return attrs.substr(pos, end - pos);
+}
+
+/// Extract id attribute value from attributes string
+std::string ExtractId(const std::string &attrs) {
+    size_t pos = attrs.find("id=");
+    if (pos == std::string::npos) return "";
+
+    pos += 3;
+    if (pos >= attrs.size()) return "";
+
+    char quote = attrs[pos];
+    if (quote != '"' && quote != '\'') return "";
+
+    pos++;
+    size_t end = attrs.find(quote, pos);
+    if (end == std::string::npos) return attrs.substr(pos);
+
+    return attrs.substr(pos, end - pos);
+}
+
+/// Convert string to lowercase
+std::string ToLower(const std::string &s) {
+    std::string result = s;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](char c) { return std::tolower(static_cast<unsigned char>(c)); });
+    return result;
+}
+
+/// Self-closing HTML tags
+const std::unordered_set<std::string> SelfClosingTags = {
+    "br", "hr", "img", "meta", "link", "colophon", "area", "sourcecode"
+};
+
+/// Skip tags (by tag name)
+const std::unordered_set<std::string> SkipTagNames = {
+    "script", "style", "meta", "noscript", "link"
+};
+
+/// Skip ID values
+const std::unordered_set<std::string> SkipIdValues = {
+    "catlinks", "footer", "mw-navigation"
+};
+
+/// Skip class substrings
+const std::vector<std::string> SkipClassValues = {
+    "t-navbar-menu", "t-navbar-sep", "printfooter",
+    "mw-editsection", "noprint", "navbox", "referencelist"
+};
+
+} // anonymous namespace
+
+// ExtractionConfig constructor
+CppReferenceExtractor::ExtractionConfig::ExtractionConfig()
+    : format(CppReferenceExtractor::Format::Markdown)
+    , code_fence("```")
+    , preserve_links(true)
+    , link_format("[{text}]({url})")
+    , max_heading_level(6)
+    , include_metadata(true)
+{
+}
+
+// HTML Parser Implementation
+
+std::shared_ptr<CppReferenceExtractor::HtmlNode> CppReferenceExtractor::ParseHtml(const std::string &html) {
+    auto tokens = Tokenize(html);
+    size_t pos = 0;
+    return BuildTree(tokens, pos);
+}
+
+std::shared_ptr<CppReferenceExtractor::HtmlNode> CppReferenceExtractor::ParseHtmlFragment(const std::string &html) {
+    auto tokens = Tokenize(html);
+    size_t pos = 0;
+    return BuildTree(tokens, pos);
+}
+
+std::vector<CppReferenceExtractor::Token> CppReferenceExtractor::Tokenize(const std::string &html) {
+    std::vector<Token> tokens;
+    size_t i = 0;
+
+    while (i < html.size()) {
+        if (html[i] == '<') {
+            size_t end = html.find('>', i);
+            if (end == std::string::npos) {
+                size_t next = html.find('<', i + 1);
+                if (next == std::string::npos) next = html.size();
+                Token textToken;
+                textToken.type = CppReferenceExtractor::Token::Type::Text;
+                textToken.text = html.substr(i, next - i);
+                tokens.push_back(textToken);
+                i = next;
+                continue;
+            }
+
+            std::string tagContent = html.substr(i + 1, end - i - 1);
+
+            if (tagContent.substr(0, 3) == "!--") {
+                Token commentToken;
+                commentToken.type = CppReferenceExtractor::Token::Type::Comment;
+                tokens.push_back(commentToken);
+                i = end + 1;
+                continue;
+            }
+
+            if (!tagContent.empty() && tagContent[0] == '/') {
+                Token closeToken;
+                closeToken.type = CppReferenceExtractor::Token::Type::CloseTag;
+                std::string tagName = tagContent.substr(1);
+                size_t spacePos = tagName.find_first_of(" \t\n\r>");
+                if (spacePos != std::string::npos) {
+                    tagName = tagName.substr(0, spacePos);
+                }
+                closeToken.tag = ToLower(tagName);
+                tokens.push_back(closeToken);
+                i = end + 1;
+                continue;
+            }
+
+            Token openToken;
+            openToken.type = CppReferenceExtractor::Token::Type::OpenTag;
+
+            size_t spacePos = tagContent.find_first_of(" \t\n\r/>");
+            if (spacePos != std::string::npos) {
+                openToken.tag = ToLower(tagContent.substr(0, spacePos));
+                openToken.attributes = tagContent.substr(spacePos);
+            } else {
+                openToken.tag = ToLower(tagContent);
+                openToken.attributes = "";
+            }
+
+            tokens.push_back(openToken);
+            i = end + 1;
+        } else {
+            size_t next = html.find('<', i);
+            if (next == std::string::npos) next = html.size();
+
+            Token textToken;
+            textToken.type = CppReferenceExtractor::Token::Type::Text;
+            textToken.text = DecodeHtmlEntities(html.substr(i, next - i));
+            tokens.push_back(textToken);
+            i = next;
         }
     }
 
-    return nullptr;
+    Token eofToken;
+    eofToken.type = CppReferenceExtractor::Token::Type::Eof;
+    tokens.push_back(eofToken);
+
+    return tokens;
 }
+
+std::shared_ptr<CppReferenceExtractor::HtmlNode> CppReferenceExtractor::BuildTree(
+    const std::vector<Token> &tokens, size_t &pos) {
+
+    auto root = std::make_shared<HtmlNode>(HtmlNode::Type::Element);
+
+    while (pos < tokens.size() && tokens[pos].type != CppReferenceExtractor::Token::Type::Eof) {
+        const Token &token = tokens[pos];
+
+        if (token.type == CppReferenceExtractor::Token::Type::Text) {
+            auto textNode = std::make_shared<HtmlNode>(HtmlNode::Type::Text);
+            textNode->text = token.text;
+            root->children.push_back(textNode);
+            pos++;
+        }
+        else if (token.type == CppReferenceExtractor::Token::Type::Comment) {
+            auto commentNode = std::make_shared<HtmlNode>(HtmlNode::Type::Comment);
+            root->children.push_back(commentNode);
+            pos++;
+        }
+        else if (token.type == CppReferenceExtractor::Token::Type::OpenTag) {
+            auto element = std::make_shared<HtmlNode>(HtmlNode::Type::Element);
+            element->tag = token.tag;
+            element->attributes = token.attributes;
+            element->class_value = ExtractClass(token.attributes);
+            element->id_value = ExtractId(token.attributes);
+
+            bool selfClosing = false;
+            if (!token.attributes.empty()) {
+                size_t slashPos = token.attributes.rfind('/');
+                if (slashPos != std::string::npos) {
+                    selfClosing = true;
+                }
+            }
+
+            if (selfClosing || SelfClosingTags.count(token.tag)) {
+                root->children.push_back(element);
+                pos++;
+                continue;
+            }
+
+            root->children.push_back(element);
+            pos++;
+
+            auto childrenRoot = BuildTree(tokens, pos);
+            element->children = childrenRoot->children;
+
+            if (pos < tokens.size() && tokens[pos].type == CppReferenceExtractor::Token::Type::CloseTag &&
+                tokens[pos].tag == token.tag) {
+                pos++;
+            }
+        }
+        else if (token.type == CppReferenceExtractor::Token::Type::CloseTag) {
+            break;
+        }
+        else {
+            pos++;
+        }
+    }
+
+    return root;
 }
+
+// Extractor Implementation
 
 CppReferenceExtractor::CppReferenceExtractor()
-    : m_document(nullptr)
+    : m_output(nullptr)
+    , m_tableType(TableType::None)
+    , m_tableColumn(0)
+    , m_preDepth(0)
+    , m_ddDepth(0)
 {
+    m_outputText.reserve(4096);
 }
 
-CppReferenceExtractor::~CppReferenceExtractor()
+CppReferenceExtractor::~CppReferenceExtractor() = default;
+
+bool CppReferenceExtractor::Convert(
+    const std::filesystem::path &inputFile,
+    const std::filesystem::path &outputFile,
+    const ExtractionConfig &config)
 {
-    if (m_document != nullptr)
-    {
-        lxb_html_document_destroy(m_document);
-        m_document = nullptr;
+    (void)config;
+
+    std::ifstream inputFileStream(inputFile, std::ios::binary);
+    if (!inputFileStream.is_open()) {
+        return false;
     }
+
+    std::stringstream buffer;
+    buffer << inputFileStream.rdbuf();
+    std::string htmlContent = buffer.str();
+
+    auto document = ParseHtml(htmlContent);
+    if (!document || document->children.empty()) {
+        return false;
+    }
+
+    std::ofstream outputFileStream(outputFile);
+    if (!outputFileStream.is_open()) {
+        return false;
+    }
+
+    m_output = &outputFileStream;
+    m_outputText.clear();
+    m_tableStack.clear();
+    m_tableType = TableType::None;
+    m_tableColumn = 0;
+    m_preDepth = 0;
+    m_ddDepth = 0;
+
+    WritePageHeader();
+
+    const HtmlNode *contentRoot = FindContentRoot(document->children);
+    if (contentRoot) {
+        for (const auto &child : contentRoot->children) {
+            Walk(child.get());
+        }
+    }
+
+    WriteFooter();
+    TrimOutput();
+
+    outputFileStream << m_outputText;
+    m_output = nullptr;
+
+    return true;
 }
 
 bool CppReferenceExtractor::Convert(
     const std::filesystem::path &inputFile,
-    const std::filesystem::path &outputFile)
+    std::ostream &output,
+    const ExtractionConfig &config)
 {
-    if (!LoadHtml(inputFile))
-    {
+    (void)config;
+
+    std::ifstream inputFileStream(inputFile, std::ios::binary);
+    if (!inputFileStream.is_open()) {
         return false;
     }
 
-    m_output.open(outputFile);
+    std::stringstream buffer;
+    buffer << inputFileStream.rdbuf();
+    std::string htmlContent = buffer.str();
 
-    if (!m_output)
-    {
+    auto document = ParseHtml(htmlContent);
+    if (!document || document->children.empty()) {
         return false;
     }
 
-    if (m_document == nullptr)
-    {
-        return false;
+    m_output = &output;
+    m_outputText.clear();
+    m_tableStack.clear();
+    m_tableType = TableType::None;
+    m_tableColumn = 0;
+    m_preDepth = 0;
+    m_ddDepth = 0;
+
+    WritePageHeader();
+
+    const HtmlNode *contentRoot = FindContentRoot(document->children);
+    if (contentRoot) {
+        for (const auto &child : contentRoot->children) {
+            Walk(child.get());
+        }
     }
 
-    lxb_dom_element_t *content = FindContentRoot();
+    WriteFooter();
+    TrimOutput();
 
-    if (content == nullptr)
-    {
-        return false;
+    if (m_output) {
+        *m_output << m_outputText;
+    }
+    m_output = nullptr;
+
+    return true;
+}
+
+std::string CppReferenceExtractor::ExtractFromMemory(
+    const std::string &html,
+    const ExtractionConfig &config)
+{
+    (void)config;
+
+    auto document = ParseHtml(html);
+    if (!document || document->children.empty()) {
+        return "";
     }
 
     m_outputText.clear();
@@ -118,415 +435,180 @@ bool CppReferenceExtractor::Convert(
     m_tableType = TableType::None;
     m_tableColumn = 0;
     m_preDepth = 0;
+    m_ddDepth = 0;
 
-    WritePageHeader();
-    Walk(lxb_dom_interface_node(content));
-    WriteFooter();
+    const HtmlNode *contentRoot = FindContentRoot(document->children);
+    if (contentRoot) {
+        for (const auto &child : contentRoot->children) {
+            Walk(child.get());
+        }
+    }
+
     TrimOutput();
 
-    m_output << m_outputText;
-
-    return static_cast<bool>(m_output);
+    std::string result = m_outputText;
+    return result;
 }
 
-bool CppReferenceExtractor::LoadHtml(
-    const std::filesystem::path &file)
-{
-    std::ifstream input(file, std::ios::binary);
-
-    if (!input.is_open())
-    {
-        return false;
-    }
-
-    std::stringstream buffer;
-    buffer << input.rdbuf();
-
-    std::string html = buffer.str();
-
-    if (html.empty())
-    {
-        return false;
-    }
-
-    if (m_document != nullptr)
-    {
-        lxb_html_document_destroy(m_document);
-        m_document = nullptr;
-    }
-
-    lxb_html_parser_t *parser =
-        lxb_html_parser_create();
-
-    if (parser == nullptr)
-    {
-        return false;
-    }
-
-    lxb_status_t status =
-        lxb_html_parser_init(parser);
-
-    if (status != LXB_STATUS_OK)
-    {
-        lxb_html_parser_destroy(parser);
-
-        return false;
-    }
-
-    m_document =
-        lxb_html_parse(
-            parser,
-            reinterpret_cast<const lxb_char_t *>(html.data()),
-            html.size());
-
-    lxb_html_parser_destroy(parser);
-
-    return m_document != nullptr;
+std::string CppReferenceExtractor::Version() {
+    return "CppReferenceParser v2.0";
 }
 
-void CppReferenceExtractor::Walk(lxb_dom_node_t *node)
-{
-    if (node == nullptr)
-    {
-        return;
-    }
-
-    switch (node->type)
-    {
-    case LXB_DOM_NODE_TYPE_ELEMENT:
-    {
-        lxb_dom_element_t *element =
-            lxb_dom_interface_element(node);
-
-        if (!VisitElement(element))
-        {
-            return;
-        }
-
-        WalkChildren(node);
-        LeaveElement(element);
-        return;
-    }
-
-    case LXB_DOM_NODE_TYPE_TEXT:
-    {
-        VisitText(lxb_dom_interface_text(node));
-        return;
-    }
-
-    default:
-        break;
-    }
-
-    WalkChildren(node);
+std::string CppReferenceExtractor::Name() {
+    return "C++ Reference Text Extractor";
 }
 
-void CppReferenceExtractor::WalkChildren(lxb_dom_node_t *node)
-{
-    if (node == nullptr)
-    {
-        return;
-    }
+// Walker and Visitor
 
-    for (lxb_dom_node_t *child = node->first_child;
-         child != nullptr;
-         child = child->next)
-    {
-        Walk(child);
+void CppReferenceExtractor::Walk(const HtmlNode *node) {
+    if (!node) return;
+
+    switch (node->type) {
+        case HtmlNode::Type::Element:
+            VisitElement(node);
+            for (const auto &child : node->children) {
+                Walk(child.get());
+            }
+            LeaveElement(node);
+            break;
+        case HtmlNode::Type::Text:
+            VisitText(node);
+            break;
+        case HtmlNode::Type::Comment:
+            break;
     }
 }
 
-bool CppReferenceExtractor::VisitElement(
-    lxb_dom_element_t *element)
-{
-    if (ShouldSkipElement(element))
-    {
-        return false;
+void CppReferenceExtractor::WalkChildren(const HtmlNode *node) {
+    if (!node) return;
+    for (const auto &child : node->children) {
+        Walk(child.get());
+    }
+}
+
+void CppReferenceExtractor::VisitElement(const HtmlNode *element) {
+    if (!element) return;
+
+    if (ShouldSkipElement(element)) {
+        return;
     }
 
-    if (HasClass(element, "spacer"))
-    {
+    const std::string &tag = element->tag;
+
+    if (element->class_value.find("spacer") != std::string::npos) {
         EnsureNewline();
-        return false;
+        return;
     }
 
-    if (HasClass(element, "t-navbar-head") ||
-        HasClass(element, "t-li1") ||
-        HasClass(element, "t-example-live-link") ||
-        HasClass(element, "coliru-btn"))
-    {
-        EnsureNewline();
-    }
-
-    if (m_tableType == TableType::Description &&
-        m_tableColumn == 1 &&
-        HasClass(element, "t-lines"))
-    {
-        EnsureNewline();
-    }
-
-    switch (lxb_dom_element_tag_id(element))
-    {
-    case LXB_TAG_TABLE:
+    if (tag == "table") {
         m_tableStack.push_back(m_tableType);
         m_tableType = DetectTableType(element);
         m_tableColumn = 0;
         EnsureNewline();
-        break;
-
-    case LXB_TAG_TR:
+    }
+    else if (tag == "tr") {
         m_tableColumn = 0;
         EnsureNewline();
-        break;
-
-    case LXB_TAG_TH:
-    case LXB_TAG_TD:
-        if (m_tableColumn > 0)
-        {
-            if ((m_tableType == TableType::Declaration ||
-                 m_tableType == TableType::Description) &&
-                m_tableColumn == 1)
-            {
-                EnsureNewline();
-                Write("\t");
-            }
-            else
-            {
-                Write("\t");
-            }
+    }
+    else if (tag == "th" || tag == "td") {
+        if (m_tableColumn > 0) {
+            Write("\t");
         }
-
         ++m_tableColumn;
-        break;
-
-    case LXB_TAG_H1:
-    case LXB_TAG_H2:
-    case LXB_TAG_H3:
-    case LXB_TAG_H4:
-    case LXB_TAG_H5:
-    case LXB_TAG_H6:
+    }
+    else if (tag == "h1") {
         EnsureNewline();
-        break;
-
-    case LXB_TAG_P:
-    case LXB_TAG_UL:
-    case LXB_TAG_OL:
-    case LXB_TAG_DL:
-    case LXB_TAG_DT:
+    }
+    else if (tag == "h2" || tag == "h3" || tag == "h4" ||
+             tag == "h5" || tag == "h6") {
         EnsureNewline();
-        break;
-
-    case LXB_TAG_DD:
+    }
+    else if (tag == "p" || tag == "ul" || tag == "ol" ||
+             tag == "dl" || tag == "dt") {
+        EnsureNewline();
+    }
+    else if (tag == "dd") {
         EnsureNewline();
         Write("\t");
-        break;
-
-    case LXB_TAG_BR:
+    }
+    else if (tag == "br") {
         EnsureNewline();
-        break;
-
-    case LXB_TAG_PRE:
+    }
+    else if (tag == "pre") {
         EnsureNewline();
         Write("```");
-        Write(DetectCodeLanguage(element).data());
+        Write(DetectCodeLanguage(element));
         AppendNewline();
         ++m_preDepth;
-        break;
-
-    case LXB_TAG_LI:
+    }
+    else if (tag == "li") {
         EnsureNewline();
         Write("    ");
-        break;
-
-    default:
-        break;
     }
-
-    return true;
+    else if (tag == "a") {
+        // Links - write text content as-is
+    }
 }
 
-void CppReferenceExtractor::VisitText(
-    lxb_dom_text_t *text)
-{
-    if (text == nullptr)
-    {
-        return;
-    }
-
-    const lexbor_str_t &str = text->char_data.data;
-
-    WriteText(str.data, str.length);
+void CppReferenceExtractor::VisitText(const HtmlNode *textNode) {
+    if (!textNode) return;
+    VisitTextRaw(textNode->text);
 }
 
-void CppReferenceExtractor::LeaveElement(
-    lxb_dom_element_t *element)
-{
-    switch (lxb_dom_element_tag_id(element))
-    {
-    case LXB_TAG_TABLE:
-        if (!m_tableStack.empty())
-        {
+void CppReferenceExtractor::LeaveElement(const HtmlNode *element) {
+    if (!element) return;
+
+    const std::string &tag = element->tag;
+
+    if (tag == "table") {
+        if (!m_tableStack.empty()) {
             m_tableType = m_tableStack.back();
             m_tableStack.pop_back();
-        }
-        else
-        {
+        } else {
             m_tableType = TableType::None;
         }
-
         m_tableColumn = 0;
         AppendNewline();
-        break;
-
-    case LXB_TAG_TR:
-    case LXB_TAG_UL:
-    case LXB_TAG_OL:
-    case LXB_TAG_DL:
-    case LXB_TAG_DT:
-    case LXB_TAG_DD:
-    case LXB_TAG_LI:
+    }
+    else if (tag == "tr" || tag == "ul" || tag == "ol" ||
+             tag == "dl" || tag == "dt" || tag == "dd" || tag == "li") {
         EnsureNewline();
-        break;
-
-    case LXB_TAG_H1:
+    }
+    else if (tag == "h1") {
         AppendNewline();
         AppendNewline();
-        break;
-
-    case LXB_TAG_H2:
-    case LXB_TAG_H3:
-    case LXB_TAG_H4:
-    case LXB_TAG_H5:
-    case LXB_TAG_H6:
+    }
+    else if (tag == "h2" || tag == "h3" || tag == "h4" ||
+             tag == "h5" || tag == "h6") {
         EnsureNewline();
-        break;
-
-    case LXB_TAG_P:
+    }
+    else if (tag == "p") {
         AppendNewline();
         AppendNewline();
-        break;
-
-    case LXB_TAG_PRE:
-        if (m_preDepth > 0)
-        {
-            --m_preDepth;
-        }
-
+    }
+    else if (tag == "pre") {
+        if (m_preDepth > 0) --m_preDepth;
         EnsureNewline();
         Write("```");
         AppendNewline();
-        break;
-
-    default:
-        break;
-    }
-
-    if (HasClass(element, "t-navbar-head") ||
-        HasClass(element, "t-li1") ||
-        HasClass(element, "t-example-live-link") ||
-        HasClass(element, "coliru-btn"))
-    {
-        EnsureNewline();
-    }
-
-    if (m_tableType == TableType::Description &&
-        m_tableColumn == 1 &&
-        HasClass(element, "t-lines"))
-    {
-        EnsureNewline();
     }
 }
 
-bool CppReferenceExtractor::ShouldSkipElement(
-    lxb_dom_element_t *element)
-{
-    switch (lxb_dom_element_tag_id(element))
-    {
-    case LXB_TAG_SCRIPT:
-    case LXB_TAG_STYLE:
-    case LXB_TAG_META:
-    case LXB_TAG_LINK:
-    case LXB_TAG_NOSCRIPT:
-        return true;
+bool CppReferenceExtractor::ShouldSkipElement(const HtmlNode *element) const {
+    if (!element) return true;
 
-    default:
-        break;
-    }
+    const std::string &tag = element->tag;
 
-    size_t idLength = 0;
-
-    const lxb_char_t *id =
-        lxb_dom_element_id(element, &idLength);
-
-    if (id != nullptr)
-    {
-        std::string_view idView(
-            reinterpret_cast<const char *>(id),
-            idLength);
-
-        if (idView == "catlinks" ||
-            idView == "footer" ||
-            idView == "mw-navigation")
-        {
-            return true;
-        }
-    }
-
-    if (HasClass(element, "t-navbar-menu") ||
-        HasClass(element, "t-navbar-sep") ||
-        HasClass(element, "printfooter") ||
-        HasClass(element, "mw-editsection") ||
-        HasClass(element, "noprint"))
-    {
+    if (SkipTagNames.count(tag)) {
         return true;
     }
 
-    return false;
-}
-
-bool CppReferenceExtractor::HasClass(
-    lxb_dom_element_t *element,
-    std::string_view className) const
-{
-    if (element == nullptr)
-    {
-        return false;
+    if (SkipIdValues.count(element->id_value)) {
+        return true;
     }
 
-    size_t length = 0;
-
-    const lxb_char_t *classData =
-        lxb_dom_element_class(element, &length);
-
-    if (classData == nullptr || length == 0)
-    {
-        return false;
-    }
-
-    std::string_view classes(
-        reinterpret_cast<const char *>(classData),
-        length);
-
-    size_t position = 0;
-
-    while (position < classes.size())
-    {
-        while (position < classes.size() &&
-               IsAsciiWhitespace(static_cast<unsigned char>(classes[position])))
-        {
-            ++position;
-        }
-
-        const size_t start = position;
-
-        while (position < classes.size() &&
-               !IsAsciiWhitespace(static_cast<unsigned char>(classes[position])))
-        {
-            ++position;
-        }
-
-        if (classes.substr(start, position - start) == className)
-        {
+    for (const auto &skipClass : SkipClassValues) {
+        if (element->class_value.find(skipClass) != std::string::npos) {
             return true;
         }
     }
@@ -534,346 +616,197 @@ bool CppReferenceExtractor::HasClass(
     return false;
 }
 
-CppReferenceExtractor::TableType CppReferenceExtractor::DetectTableType(
-    lxb_dom_element_t *element) const
-{
-    if (HasClass(element, "t-dcl-begin"))
-    {
+bool CppReferenceExtractor::HasClass(const HtmlNode *node, std::string_view className) const {
+    if (!node || node->type != HtmlNode::Type::Element) return false;
+
+    const std::string &classes = node->class_value;
+    size_t pos = 0;
+
+    while (pos < classes.size()) {
+        while (pos < classes.size() && IsWhitespace(classes[pos])) {
+            ++pos;
+        }
+
+        const size_t start = pos;
+        while (pos < classes.size() && !IsWhitespace(classes[pos])) {
+            ++pos;
+        }
+
+        if (pos - start == className.size() &&
+            classes.substr(start, pos - start) == className) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+CppReferenceExtractor::TableType CppReferenceExtractor::DetectTableType(const HtmlNode *node) const {
+    if (!node) return TableType::None;
+
+    if (node->class_value.find("t-dcl-begin") != std::string::npos)
         return TableType::Declaration;
-    }
-
-    if (HasClass(element, "t-par-begin"))
-    {
+    if (node->class_value.find("t-par-begin") != std::string::npos)
         return TableType::Parameters;
-    }
-
-    if (HasClass(element, "t-dsc-begin"))
-    {
+    if (node->class_value.find("t-dsc-begin") != std::string::npos)
         return TableType::Description;
-    }
 
     return TableType::Generic;
 }
 
-std::string_view CppReferenceExtractor::DetectCodeLanguage(
-    lxb_dom_element_t *element) const
-{
-    for (lxb_dom_node_t *node = lxb_dom_interface_node(element);
-         node != nullptr;
-         node = node->parent)
-    {
-        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT)
-        {
-            continue;
-        }
-
-        lxb_dom_element_t *current =
-            lxb_dom_interface_element(node);
-
-        if (HasClass(current, "source-text") ||
-            HasClass(current, "text"))
-        {
-            return "";
-        }
-
-        if (HasClass(current, "source-cpp") ||
-            HasClass(current, "cpp"))
-        {
-            return "cpp";
-        }
-    }
-
+std::string_view CppReferenceExtractor::DetectCodeLanguage(const HtmlNode *node) const {
+    (void)node;
     return "cpp";
 }
 
-void CppReferenceExtractor::WritePageHeader()
-{
-    lxb_dom_element_t *heading = FindElementById("firstHeading");
-
-    if (heading != nullptr)
-    {
-        Walk(lxb_dom_interface_node(heading));
-    }
+void CppReferenceExtractor::WritePageHeader() {
+    // Placeholder for future content extraction
 }
 
-void CppReferenceExtractor::WriteFooter()
-{
-    lxb_dom_element_t *navigation = FindElementById("cpp-navigation");
-
-    if (navigation != nullptr)
-    {
-        for (lxb_dom_node_t *child = lxb_dom_interface_node(navigation)->first_child;
-             child != nullptr;
-             child = child->next)
-        {
-            if (child->type != LXB_DOM_NODE_TYPE_ELEMENT)
-            {
-                continue;
-            }
-
-            lxb_dom_element_t *element =
-                lxb_dom_interface_element(child);
-
-            if (lxb_dom_element_tag_id(element) == LXB_TAG_UL)
-            {
-                Walk(child);
-            }
-        }
-    }
-
-    lxb_dom_element_t *lastModified =
-        FindElementById("footer-info-lastmod");
-
-    if (lastModified != nullptr)
-    {
-        Walk(lxb_dom_interface_node(lastModified));
-    }
+void CppReferenceExtractor::WriteFooter() {
+    // Placeholder for footer content
 }
 
-lxb_dom_element_t *CppReferenceExtractor::FindElementById(const char *id)
-{
-    if (m_document == nullptr || id == nullptr)
-    {
-        return nullptr;
-    }
-
-    lxb_dom_element_t *root =
-        lxb_dom_interface_element(m_document);
-
-    return lxb_dom_element_by_id(
-        root,
-        reinterpret_cast<const lxb_char_t *>(id),
-        std::strlen(id));
+const CppReferenceExtractor::HtmlNode *CppReferenceExtractor::FindElementById(const std::string &id) const {
+    (void)id;
+    return nullptr;
 }
 
-lxb_dom_element_t *CppReferenceExtractor::FindContentRoot()
-{
-    lxb_dom_element_t *content = FindElementById("mw-content-text");
-
-    if (content != nullptr)
-    {
-        return content;
+const CppReferenceExtractor::HtmlNode *CppReferenceExtractor::FindContentRoot(
+    const std::vector<std::shared_ptr<CppReferenceExtractor::HtmlNode>> &children) const {
+    // Look for mw-content-text or body element
+    for (const auto &child : children) {
+        if (!child) continue;
+        if (child->tag == "body") return child.get();
+        if (child->id_value == "mw-content-text") return child.get();
     }
 
-    if (m_document == nullptr)
-    {
-        return nullptr;
+    // If no content root found, use first child
+    if (!children.empty()) {
+        return children[0].get();
     }
 
-    return FindFirstElementByTag(
-        lxb_dom_interface_node(m_document),
-        LXB_TAG_BODY);
+    return nullptr;
 }
 
-void CppReferenceExtractor::Write(const char *text)
-{
-    if (text == nullptr)
-    {
-        return;
-    }
+// Output Writers
 
-    for (const char *current = text; *current != '\0'; ++current)
-    {
+void CppReferenceExtractor::Write(const char *text) {
+    if (!text) return;
+    for (const char *current = text; *current; ++current) {
         AppendRawByte(*current);
     }
 }
 
-void CppReferenceExtractor::Write(
-    const lxb_char_t *text,
-    size_t length)
-{
-    if (text == nullptr || length == 0)
-    {
-        return;
-    }
-
-    for (size_t index = 0; index < length; ++index)
-    {
-        AppendRawByte(static_cast<char>(text[index]));
+void CppReferenceExtractor::Write(std::string_view text) {
+    for (char ch : text) {
+        AppendRawByte(ch);
     }
 }
 
-void CppReferenceExtractor::WriteText(
-    const lxb_char_t *text,
-    size_t length)
-{
-    if (text == nullptr || length == 0)
-    {
-        return;
-    }
+void CppReferenceExtractor::VisitTextRaw(const std::string &text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
 
-    for (size_t index = 0; index < length; ++index)
-    {
-        if (IsNbsp(text, length, index))
-        {
-            if (m_preDepth > 0)
-            {
-                AppendRawByte(' ');
-            }
-            else
-            {
-                AppendTextSpace();
-            }
-
-            ++index;
-            continue;
-        }
-
-        if (IsZeroWidthSpace(text, length, index))
-        {
-            index += 2;
-            continue;
-        }
-
-        const unsigned char ch = text[index];
-
-        if (m_preDepth == 0 && IsAsciiWhitespace(ch))
-        {
+        if (ch == '\xA0') {
             AppendTextSpace();
             continue;
         }
 
-        AppendRawByte(static_cast<char>(ch));
+        // Handle zero-width space (UTF-8: \xE2\x80\x8B)
+        if (ch == '\xE2' && i + 2 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) == 0x80 &&
+            static_cast<unsigned char>(text[i + 2]) == 0x8B) {
+            i += 2;
+            continue;
+        }
+
+        if (IsWhitespace(static_cast<unsigned char>(ch))) {
+            AppendTextSpace();
+            continue;
+        }
+
+        AppendRawByte(ch);
     }
 }
 
-void CppReferenceExtractor::AppendRawByte(char ch)
-{
-    if (ch == '\r')
-    {
-        return;
-    }
+// Buffer Utilities
 
-    if (ch == '\n')
-    {
-        AppendNewline();
-        return;
-    }
-
-    if (ch == '\t')
-    {
-        TrimTrailingInlineWhitespace();
-        m_outputText.push_back('\t');
-        return;
-    }
+void CppReferenceExtractor::AppendRawByte(char ch) {
+    if (ch == '\r') return;
+    if (ch == '\n') { AppendNewline(); return; }
+    if (ch == '\t') { TrimTrailingInlineWhitespace(); m_outputText.push_back('\t'); return; }
 
     m_outputText.push_back(ch);
 }
 
-void CppReferenceExtractor::AppendTextSpace()
-{
-    if (m_outputText.empty())
-    {
-        return;
-    }
+void CppReferenceExtractor::AppendTextSpace() {
+    if (m_outputText.empty()) return;
 
     const char last = m_outputText.back();
-
-    if (last == '\n' ||
-        last == ' ' ||
-        last == '\t')
-    {
-        return;
-    }
+    if (last == '\n' || last == ' ' || last == '\t') return;
 
     m_outputText.push_back(' ');
 }
 
-void CppReferenceExtractor::EnsureNewline()
-{
+void CppReferenceExtractor::EnsureNewline() {
     TrimTrailingInlineWhitespace();
-
-    if (m_outputText.empty() ||
-        m_outputText.back() == '\n')
-    {
-        return;
-    }
-
+    if (m_outputText.empty() || m_outputText.back() == '\n') return;
     m_outputText.push_back('\n');
 }
 
-void CppReferenceExtractor::AppendNewline()
-{
+void CppReferenceExtractor::AppendNewline() {
     TrimTrailingInlineWhitespace();
-
-    if (m_outputText.empty())
-    {
-        return;
-    }
+    if (m_outputText.empty()) return;
 
     size_t newlineCount = 0;
-
-    for (size_t index = m_outputText.size(); index > 0; --index)
-    {
-        if (m_outputText[index - 1] != '\n')
-        {
-            break;
-        }
-
+    for (size_t i = m_outputText.size(); i > 0; --i) {
+        if (m_outputText[i - 1] != '\n') break;
         ++newlineCount;
     }
 
-    if (newlineCount < 2)
-    {
+    if (newlineCount < 2) {
         m_outputText.push_back('\n');
     }
 }
 
-void CppReferenceExtractor::TrimTrailingInlineWhitespace()
-{
-    while (!m_outputText.empty())
-    {
+void CppReferenceExtractor::TrimTrailingInlineWhitespace() {
+    while (!m_outputText.empty()) {
         const char last = m_outputText.back();
-
-        if (last != ' ' && last != '\t')
-        {
-            break;
-        }
-
+        if (last != ' ' && last != '\t') break;
         m_outputText.pop_back();
     }
 }
 
-void CppReferenceExtractor::TrimOutput()
-{
+void CppReferenceExtractor::TrimOutput() {
     TrimTrailingInlineWhitespace();
 
-    while (!m_outputText.empty() &&
-           m_outputText.back() == '\n')
-    {
+    while (!m_outputText.empty() && m_outputText.back() == '\n') {
         m_outputText.pop_back();
     }
 
     while (!m_outputText.empty() &&
-           (m_outputText.front() == '\n' ||
-            m_outputText.front() == ' ' ||
-            m_outputText.front() == '\t'))
-    {
+           (m_outputText.front() == '\n' || m_outputText.front() == ' ' || m_outputText.front() == '\t')) {
         m_outputText.erase(m_outputText.begin());
     }
 
     m_outputText.push_back('\n');
 }
 
-void CppReferenceExtractor::WriteAttribute(
-    lxb_dom_attr_t *attr)
-{
-    if (attr == nullptr)
-    {
-        return;
-    }
+// HTML Helpers
 
-    size_t nameLength = 0;
-    size_t valueLength = 0;
+std::string CppReferenceExtractor::ExtractClass(const std::string &attributes) {
+    return ::ExtractClass(attributes);
+}
 
-    const lxb_char_t *name =
-        lxb_dom_attr_local_name(attr, &nameLength);
+std::string CppReferenceExtractor::ExtractId(const std::string &attributes) {
+    return ::ExtractId(attributes);
+}
 
-    const lxb_char_t *value =
-        lxb_dom_attr_value(attr, &valueLength);
+std::string CppReferenceExtractor::DecodeHtmlEntities(const std::string &text) {
+    return ::DecodeHtmlEntities(text);
+}
 
-    Write(name, nameLength);
-    Write("=\"");
-    Write(value, valueLength);
-    Write("\"");
+std::string CppReferenceExtractor::ToLower(const std::string &s) {
+    return ::ToLower(s);
 }
